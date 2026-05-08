@@ -1,18 +1,19 @@
-// CS4348 Project 3
+// CS4348 Project
 // Aron Petkovski (axp220196)
-// =======================================
+// =============================================================
 //
-// What's working:
-//   - Argument parsing for all 6 commands.
-//   - `create` writes a valid 512-byte header (magic + zeros).
-//   - `open_existing` validates that a file is a real index file.
-//   - All other commands open/validate the file, then say "not implemented".
+// What's new:
+//   - Node struct with serialize/deserialize.
+//   - read_node / write_node / allocate_block.
+//   - insert: works as long as no node would need to be split.
+//             Since we never split, the tree is always exactly one node
+//             (the root), so insert succeeds for the first 19 keys and
+//             fails on the 20th with a clear error.
+//   - search: looks at the root.
 //
 // What's still missing:
-//   - Node struct, B-tree logic, every command except `create`.
-//
-// Compile:
-//   g++ -std=c++17 -O2 -Wall -o project3 project3.cpp
+//   - Splitting (split_child) — added in v3.
+//   - print, load, extract — added in v3 / v4.
 
 #include <iostream>
 #include <fstream>
@@ -24,8 +25,12 @@
 namespace fs = std::filesystem;
 
 constexpr size_t BLOCK_SIZE = 512;
+constexpr size_t MIN_DEGREE = 10;
+constexpr size_t MAX_KEYS = 2 * MIN_DEGREE - 1;     // 19
+constexpr size_t MAX_CHILDREN = 2 * MIN_DEGREE;         // 20
 static const char MAGIC[8] = { '4', '3', '4', '8', 'P', 'R', 'J', '3' };
 
+// ---------- Big-endian I/O ----------
 static void write_u64_be(uint8_t *buf, uint64_t v)
 {
     for (int i = 7; i >= 0; --i)
@@ -44,8 +49,8 @@ static uint64_t read_u64_be(const uint8_t *buf)
 
 struct Header
 {
-    uint64_t root_id = 0;   // 0 = empty tree
-    uint64_t next_block_id = 1;   // block 0 is the header itself
+    uint64_t root_id = 0;
+    uint64_t next_block_id = 1;
 
     void serialize(uint8_t *buf) const
     {
@@ -64,7 +69,66 @@ struct Header
     }
 };
 
-// ---------- BTreeFile ----------
+struct Node
+{
+    uint64_t block_id = 0;
+    uint64_t parent_id = 0;
+    uint64_t num_keys = 0;
+    uint64_t keys[MAX_KEYS] = { 0 };
+    uint64_t values[MAX_KEYS] = { 0 };
+    uint64_t children[MAX_CHILDREN] = { 0 };
+
+    bool is_leaf() const
+    { return children[0] == 0; }
+
+    void serialize(uint8_t *buf) const
+    {
+        std::memset(buf, 0, BLOCK_SIZE);
+        write_u64_be(buf, block_id);
+        write_u64_be(buf + 8, parent_id);
+        write_u64_be(buf + 16, num_keys);
+        uint8_t *p = buf + 24;
+        for (size_t i = 0; i < MAX_KEYS; ++i)
+        {
+            write_u64_be(p, keys[i]);
+            p += 8;
+        }
+        for (size_t i = 0; i < MAX_KEYS; ++i)
+        {
+            write_u64_be(p, values[i]);
+            p += 8;
+        }
+        for (size_t i = 0; i < MAX_CHILDREN; ++i)
+        {
+            write_u64_be(p, children[i]);
+            p += 8;
+        }
+    }
+
+    void deserialize(const uint8_t *buf)
+    {
+        block_id = read_u64_be(buf);
+        parent_id = read_u64_be(buf + 8);
+        num_keys = read_u64_be(buf + 16);
+        const uint8_t *p = buf + 24;
+        for (size_t i = 0; i < MAX_KEYS; ++i)
+        {
+            keys[i] = read_u64_be(p);
+            p += 8;
+        }
+        for (size_t i = 0; i < MAX_KEYS; ++i)
+        {
+            values[i] = read_u64_be(p);
+            p += 8;
+        }
+        for (size_t i = 0; i < MAX_CHILDREN; ++i)
+        {
+            children[i] = read_u64_be(p);
+            p += 8;
+        }
+    }
+};
+
 class BTreeFile
 {
 public:
@@ -80,11 +144,7 @@ public:
             return false;
         }
         std::ofstream out(fname, std::ios::binary | std::ios::trunc);
-        if (!out)
-        {
-            std::cerr << "Error: cannot create file '" << fname << "'.\n";
-            return false;
-        }
+        if (!out) return false;
         Header h;
         uint8_t buf[BLOCK_SIZE];
         h.serialize(buf);
@@ -100,38 +160,137 @@ public:
             return false;
         }
         file.open(fname, std::ios::binary | std::ios::in | std::ios::out);
-        if (!file)
-        {
-            std::cerr << "Error: cannot open file '" << fname << "'.\n";
-            return false;
-        }
+        if (!file) return false;
         filename = fname;
         uint8_t buf[BLOCK_SIZE];
         file.read(reinterpret_cast<char *>(buf), BLOCK_SIZE);
-        if (file.gcount() != static_cast<std::streamsize>(BLOCK_SIZE))
+        if (file.gcount() != static_cast<std::streamsize>(BLOCK_SIZE) ||
+            !header.deserialize(buf))
         {
             std::cerr << "Error: '" << fname << "' is not a valid index file.\n";
             return false;
         }
-        if (!header.deserialize(buf))
-        {
-            std::cerr << "Error: '" << fname << "' is not a valid index file (bad magic).\n";
-            return false;
-        }
         return true;
     }
+
+    void write_header()
+    {
+        uint8_t buf[BLOCK_SIZE];
+        header.serialize(buf);
+        file.seekp(0);
+        file.write(reinterpret_cast<char *>(buf), BLOCK_SIZE);
+        file.flush();
+    }
+
+    void read_node(uint64_t id, Node &n)
+    {
+        uint8_t buf[BLOCK_SIZE];
+        file.seekg(static_cast<std::streamoff>(id) * BLOCK_SIZE);
+        file.read(reinterpret_cast<char *>(buf), BLOCK_SIZE);
+        n.deserialize(buf);
+    }
+
+    void write_node(const Node &n)
+    {
+        uint8_t buf[BLOCK_SIZE];
+        n.serialize(buf);
+        file.seekp(static_cast<std::streamoff>(n.block_id) * BLOCK_SIZE);
+        file.write(reinterpret_cast<char *>(buf), BLOCK_SIZE);
+        file.flush();
+    }
+
+    uint64_t allocate_block()
+    {
+        uint64_t id = header.next_block_id++;
+        write_header();
+        return id;
+    }
+
+    // No-split insert: only works if the root has < 19 keys.
+    bool insert(uint64_t key, uint64_t value)
+    {
+        // Empty tree: create the root.
+        if (header.root_id == 0)
+        {
+            Node root;
+            root.block_id = allocate_block();
+            root.parent_id = 0;
+            root.num_keys = 1;
+            root.keys[0] = key;
+            root.values[0] = value;
+            header.root_id = root.block_id;
+            write_header();
+            write_node(root);
+            return true;
+        }
+
+        Node root;
+        read_node(header.root_id, root);
+
+        // Without splitting, we can't grow the tree past one full node.
+        if (root.num_keys == MAX_KEYS)
+        {
+            std::cerr << "Error: root is full and splitting is not yet implemented.\n";
+            return false;
+        }
+
+        // Insert in sorted position.
+        size_t pos = 0;
+        while (pos < root.num_keys && root.keys[pos] < key) ++pos;
+        if (pos < root.num_keys && root.keys[pos] == key)
+        {
+            std::cerr << "Error: key " << key << " already exists.\n";
+            return false;
+        }
+        for (size_t i = root.num_keys; i > pos; --i)
+        {
+            root.keys[i] = root.keys[i - 1];
+            root.values[i] = root.values[i - 1];
+        }
+        root.keys[pos] = key;
+        root.values[pos] = value;
+        root.num_keys++;
+        write_node(root);
+        return true;
+    }
+
+    // Search the (single-node) tree.
+    bool search(uint64_t key, uint64_t &value_out)
+    {
+        if (header.root_id == 0) return false;
+        Node root;
+        read_node(header.root_id, root);
+        for (size_t i = 0; i < root.num_keys; ++i)
+        {
+            if (root.keys[i] == key)
+            {
+                value_out = root.values[i];
+                return true;
+            }
+            if (root.keys[i] > key) return false;   // sorted, can stop early
+        }
+        return false;
+    }
 };
+
+static bool parse_uint64(const std::string &s, uint64_t &out)
+{
+    if (s.empty() || s.find('-') != std::string::npos) return false;
+    try
+    {
+        size_t pos;
+        unsigned long long v = std::stoull(s, &pos);
+        if (pos != s.size()) return false;
+        out = static_cast<uint64_t>(v);
+        return true;
+    } catch (...)
+    { return false; }
+}
 
 static void usage(const char *prog)
 {
     std::cerr << "Usage: " << prog << " <command> <args>\n"
-              << "Commands:\n"
-              << "  create  <indexfile>\n"
-              << "  insert  <indexfile> <key> <value>\n"
-              << "  search  <indexfile> <key>\n"
-              << "  load    <indexfile> <csvfile>\n"
-              << "  print   <indexfile>\n"
-              << "  extract <indexfile> <outfile>\n";
+              << "Commands: create, insert, search, [load, print, extract NOT YET]\n";
 }
 
 int main(int argc, char *argv[])
@@ -152,24 +311,57 @@ int main(int argc, char *argv[])
         }
         return BTreeFile::create_new(argv[2]) ? 0 : 1;
     }
-
-    // Every other command: validate the file is a real index file,
-    // then admit we haven't implemented the operation yet.
-    if (cmd == "insert" || cmd == "search" || cmd == "load" ||
-        cmd == "print" || cmd == "extract")
+    if (cmd == "insert")
     {
-        if (argc < 3)
+        if (argc != 5)
         {
             usage(argv[0]);
             return 1;
         }
+        uint64_t k, v;
+        if (!parse_uint64(argv[3], k))
+        {
+            std::cerr << "Error: invalid key.\n";
+            return 1;
+        }
+        if (!parse_uint64(argv[4], v))
+        {
+            std::cerr << "Error: invalid value.\n";
+            return 1;
+        }
         BTreeFile bt;
         if (!bt.open_existing(argv[2])) return 1;
-        std::cerr << "Command '" << cmd << "' is not yet implemented.\n";
+        return bt.insert(k, v) ? 0 : 1;
+    }
+    if (cmd == "search")
+    {
+        if (argc != 4)
+        {
+            usage(argv[0]);
+            return 1;
+        }
+        uint64_t k;
+        if (!parse_uint64(argv[3], k))
+        {
+            std::cerr << "Error: invalid key.\n";
+            return 1;
+        }
+        BTreeFile bt;
+        if (!bt.open_existing(argv[2])) return 1;
+        uint64_t v;
+        if (bt.search(k, v))
+        {
+            std::cout << k << ' ' << v << '\n';
+            return 0;
+        }
+        std::cerr << "Error: key " << k << " not found.\n";
         return 1;
     }
-
+    if (cmd == "load" || cmd == "print" || cmd == "extract")
+    {
+        std::cerr << "Command '" << cmd << "' is not yet implemented (coming in v3/v4).\n";
+        return 1;
+    }
     std::cerr << "Unknown command: " << cmd << "\n";
-    usage(argv[0]);
     return 1;
 }

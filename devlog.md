@@ -1,1 +1,3 @@
 5/8/2026 4:15PM: I have added the argument parsing. `create` also writes a valid header. `open_existing` validates the magic number; other commands stub out with a clean error. No B-tree yet for the actual indexing of the file. I need to implement the B-Tree and implement a `Node` structure with I/O interactions. I also need to implement `insert` and `search`.
+
+5/8/2026 439PM: Now it has a basic insert/search. There is no splitting with the nodes, like a proper B-Tree. I'm definitely going to need some more assistance on how to properly handle that. B-Tree's are very complicated.
