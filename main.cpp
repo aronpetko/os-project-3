@@ -1,19 +1,5 @@
-// CS4348 Project 3 — VERSION 4: Complete
-//
-// What's new since v3:
-//   - load <indexfile> <csvfile>: bulk insert from CSV.
-//   - extract <indexfile> <outfile>: dump tree to CSV.
-//
-// All 6 commands now functional.
-//
-// Compile:  g++ -std=c++17 -O2 -Wall -o project3 project3.cpp
-//
-// Memory rule: at most 3 Node objects are ever held simultaneously.
-// We achieve this by:
-//   - Top-down (preemptive) splitting during insert.
-//   - Iterative search and traversal (one node loaded at a time).
-//   - Reusing the `sibling` variable inside split_child() when fixing
-//     up the parent_id of the children we moved to the new sibling.
+// CS4348 Project 3
+// Aron Petkovski (axp220196)
 
 #include <cstdint>
 #include <cstring>
